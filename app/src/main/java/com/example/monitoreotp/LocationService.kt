@@ -7,13 +7,14 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
-import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.work.*
 import com.google.android.gms.location.*
 import kotlinx.coroutines.*
@@ -25,12 +26,14 @@ class LocationService : Service() {
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
-    private val CHANNEL_ID = "location_channel"
+    private val CHANNEL_ID = "location_channel_v2"
     private val NOTIFICATION_ID = 1001
 
     private lateinit var prefs: android.content.SharedPreferences
     private var lastSendTime = 0L
     private var isServiceActive = false
+
+    private var cachedDeviceId: String = ""
 
     private lateinit var connectivityMonitor: ConnectivityMonitor
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -38,43 +41,62 @@ class LocationService : Service() {
     override fun onCreate() {
         super.onCreate()
 
-        // Inicializar preferencias
-        prefs = getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+        createNotificationChannel()
+        val notification = createNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
 
-        // Inicializar API
+        prefs = applicationContext.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+
         ApiClient.initialize(this)
 
-        // Inicializar ConnectivityMonitor
         connectivityMonitor = ConnectivityMonitor(
             this,
             onNetworkAvailable = {
-                Log.d("LocationService", "🌐 Red disponible, lanzando envío inmediato")
+                Log.d("LocationService", "🌐 Red disponible, activando envío inmediato")
                 triggerImmediateUpload()
             },
-            onNetworkLost = {
-                Log.d("LocationService", "📴 Red perdida")
-            }
+            onNetworkLost = { Log.d("LocationService", "📴 Red perdida") }
         )
         connectivityMonitor.startMonitoring()
 
-        // Configurar notificación
-        createNotificationChannel()
-        startForeground(NOTIFICATION_ID, createNotification())
-
-        // Inicializar FusedLocationClient
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
-        // Programar WorkManager
         scheduleUploadWorker()
         scheduleWatchdog()
-
-        // Iniciar actualizaciones de ubicación
         startLocationUpdates()
-
-        // Programar limpieza de ubicaciones offline antiguas
         scheduleCleanup()
 
         Log.d("LocationService", "✅ Servicio iniciado correctamente")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // recibir IMEI desde BootReceiver o MainActivity
+        intent?.getStringExtra("EXTRA_DEVICE_ID")?.let {
+            if (it.length == 15 && it.matches(Regex("^\\d{15}$"))) {
+                cachedDeviceId = it
+                // Refrescamos SharedPreferences para que el resto del código lo vea consistente
+                prefs.edit().putString("device_id", it).apply()
+                Log.d("LocationService", "📥 IMEI recibido por Intent: $it")
+            }
+        }
+
+        //si el sistema revivió el servicio (START_STICKY con intent nulo),
+        // caemos a SharedPreferences. En este punto el archivo ya está estable.
+        if (cachedDeviceId.isEmpty()) {
+            cachedDeviceId = prefs.getString("device_id", "") ?: ""
+            Log.d("LocationService", "📂 IMEI recuperado desde prefs: $cachedDeviceId")
+        }
+
+        return START_STICKY
     }
 
     private fun startLocationUpdates() {
@@ -92,9 +114,9 @@ class LocationService : Service() {
 
         val locationRequest = LocationRequest.Builder(
             Priority.PRIORITY_HIGH_ACCURACY,
-            5000L // UPDATE_INTERVAL
+            5000L
         ).apply {
-            setMinUpdateIntervalMillis(3000L) // FASTEST_INTERVAL
+            setMinUpdateIntervalMillis(3000L)
             setMaxUpdateDelayMillis(0)
             setWaitForAccurateLocation(true)
             setMinUpdateDistanceMeters(0f)
@@ -102,19 +124,17 @@ class LocationService : Service() {
 
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
-                val location = locationResult.lastLocation
-                location?.let {
-                    val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastSendTime >= 5000L) { // SEND_INTERVAL
-                        lastSendTime = currentTime
-                        serviceScope.launch {
-                            sendLocationWithRetry(
-                                it.latitude,
-                                it.longitude,
-                                it.accuracy,
-                                it.speed
-                            )
-                        }
+                val location = locationResult.lastLocation ?: return
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastSendTime >= 5000L) {
+                    lastSendTime = currentTime
+                    serviceScope.launch {
+                        sendLocationWithRetry(
+                            location.latitude,
+                            location.longitude,
+                            location.accuracy,
+                            location.speed
+                        )
                     }
                 }
             }
@@ -137,17 +157,17 @@ class LocationService : Service() {
         speed: Float?,
         maxRetries: Int = 3
     ) {
-        val deviceId = prefs.getString("device_id", "") ?: ""
+        // 🔑 Usamos la variable cacheada (viene del Intent o, en su defecto, de prefs)
+        val deviceId = cachedDeviceId
         if (deviceId.isEmpty() || deviceId.length != 15) {
-            Log.e("LocationService", "❌ IMEI inválido: '$deviceId'")
+            Log.e("LocationService", "❌ IMEI inválido: '$deviceId' — abortando envío")
             return
         }
 
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-        dateFormat.timeZone = TimeZone.getTimeZone("UTC")
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
         val timestamp = dateFormat.format(Date())
-
-        val batteryLevel = getBatteryLevel()
 
         val locationData = LocationRequestData(
             device_id = deviceId,
@@ -155,7 +175,7 @@ class LocationService : Service() {
             longitude = lng,
             accuracy = accuracy,
             speed = speed,
-            battery_level = batteryLevel,
+            battery_level = getBatteryLevel(),
             timestamp = timestamp
         )
 
@@ -165,35 +185,27 @@ class LocationService : Service() {
         while (!success && attempts < maxRetries) {
             try {
                 val response = ApiClient.getInstance().sendLocation(locationData)
-
                 if (response.isSuccessful) {
                     success = true
-                    prefs.edit().putBoolean("api_ok", true).apply()
-                    prefs.edit().putFloat("last_lat", lat.toFloat()).apply()
-                    prefs.edit().putFloat("last_lng", lng.toFloat()).apply()
-
-                    // Actualizar contador en UI
-                    val count = prefs.getInt("locations_sent", 0)
-                    prefs.edit().putInt("locations_sent", count + 1).apply()
-
+                    prefs.edit()
+                        .putBoolean("api_ok", true)
+                        .putFloat("last_lat", lat.toFloat())
+                        .putFloat("last_lng", lng.toFloat())
+                        .putInt("locations_sent", prefs.getInt("locations_sent", 0) + 1)
+                        .apply()
                     Log.d("LocationService", "✅ Ubicación enviada correctamente")
                 } else {
                     Log.e("LocationService", "⚠️ Error en envío: ${response.code()}")
                     attempts++
-                    if (attempts < maxRetries) {
-                        delay(2000L * (1L shl attempts))
-                    }
+                    if (attempts < maxRetries) delay(2000L * (1L shl attempts))
                 }
             } catch (e: Exception) {
                 Log.e("LocationService", "❌ Error enviando ubicación: ${e.message}")
                 attempts++
-                if (attempts < maxRetries) {
-                    delay(2000L * (1L shl attempts))
-                }
+                if (attempts < maxRetries) delay(2000L * (1L shl attempts))
             }
         }
 
-        // Si fallaron todos los reintentos, guardar offline
         if (!success) {
             saveLocationOffline(lat, lng, accuracy, speed)
         }
@@ -201,25 +213,20 @@ class LocationService : Service() {
 
     private suspend fun saveLocationOffline(lat: Double, lng: Double, accuracy: Float?, speed: Float?) {
         try {
-            val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-            dateFormat.timeZone = TimeZone.getTimeZone("UTC")
-            val timestamp = dateFormat.format(Date())
-
+            val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
             val location = OfflineLocation(
                 latitude = lat,
                 longitude = lng,
                 accuracy = accuracy,
                 speed = speed,
                 batteryLevel = getBatteryLevel(),
-                timestamp = timestamp
+                timestamp = dateFormat.format(Date())
             )
-
             val dao = AppDatabase.getInstance(this).offlineLocationDao()
             dao.insert(location)
-
-            val count = dao.getCount()
-            Log.d("LocationService", "💾 Ubicación guardada offline (total: $count)")
-
+            Log.d("LocationService", "💾 Ubicación guardada offline (total: ${dao.getCount()})")
         } catch (e: Exception) {
             Log.e("LocationService", "❌ Error guardando offline: ${e.message}")
         }
@@ -227,50 +234,40 @@ class LocationService : Service() {
 
     private fun getBatteryLevel(): Int? {
         return try {
-            val batteryManager = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
-            batteryManager?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
-        } catch (e: Exception) {
-            null
-        }
+            val bm = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+            bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        } catch (e: Exception) { null }
     }
 
     private fun scheduleUploadWorker() {
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.CONNECTED)
-            .build()
-
+            .setRequiredNetworkType(NetworkType.CONNECTED).build()
         val request = PeriodicWorkRequestBuilder<UploadWorker>(15, TimeUnit.MINUTES)
             .setConstraints(constraints)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
             .build()
-
         WorkManager.getInstance(this).enqueueUniquePeriodicWork(
-            "upload_work",
-            ExistingPeriodicWorkPolicy.KEEP,
-            request
+            "upload_work", ExistingPeriodicWorkPolicy.KEEP, request
         )
     }
 
     private fun triggerImmediateUpload() {
         val workRequest = OneTimeWorkRequestBuilder<UploadWorker>()
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
             .build()
-
         WorkManager.getInstance(this).enqueueUniqueWork(
-            "immediate_upload",
-            ExistingWorkPolicy.REPLACE,
-            workRequest
+            "immediate_upload", ExistingWorkPolicy.REPLACE, workRequest
         )
     }
 
     private fun scheduleWatchdog() {
-        val request = PeriodicWorkRequestBuilder<ServiceWatchdogWorker>(15, TimeUnit.MINUTES)
-            .build()
-
+        val request = PeriodicWorkRequestBuilder<ServiceWatchdogWorker>(15, TimeUnit.MINUTES).build()
         WorkManager.getInstance(this).enqueueUniquePeriodicWork(
-            "watchdog_work",
-            ExistingPeriodicWorkPolicy.KEEP,
-            request
+            "watchdog_work", ExistingPeriodicWorkPolicy.KEEP, request
         )
     }
 
@@ -282,7 +279,7 @@ class LocationService : Service() {
                     val dao = AppDatabase.getInstance(this@LocationService).offlineLocationDao()
                     val maxAge = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
                     dao.deleteOld(maxAge)
-                    Log.d("LocationService", "🧹 Limpieza de ubicaciones antiguas completada")
+                    Log.d("LocationService", "🧹 Limpieza completada")
                 } catch (e: Exception) {
                     Log.e("LocationService", "❌ Error en limpieza: ${e.message}")
                 }
@@ -292,6 +289,7 @@ class LocationService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // IMPORTANCE_LOW evita sonidos molestos, pero Motorola respeta mejor LOW para servicios persistentes
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Monitoreo de Flota",
@@ -299,6 +297,8 @@ class LocationService : Service() {
             ).apply {
                 description = "Notificación persistente para tracking GPS"
                 setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
@@ -311,12 +311,9 @@ class LocationService : Service() {
             .setContentText("Monitoreo de ubicación activo")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setOngoing(true)
             .build()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -324,16 +321,13 @@ class LocationService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isServiceActive = false
-
         connectivityMonitor.stopMonitoring()
         serviceScope.cancel()
-
         try {
             fusedLocationClient.removeLocationUpdates(locationCallback)
         } catch (e: Exception) {
             Log.e("LocationService", "❌ Error removiendo actualizaciones: ${e.message}")
         }
-
         Log.d("LocationService", "🛑 Servicio detenido")
     }
 }

@@ -46,7 +46,11 @@ class MainActivity : ComponentActivity() {
     ) { permissions ->
         val allGranted = permissions.values.all { it }
         if (allGranted) {
-            startLocationService()
+            Toast.makeText(
+                this,
+                "Permisos concedidos. Puede iniciar el monitoreo.",
+                Toast.LENGTH_SHORT
+            ).show()
         } else {
             Toast.makeText(
                 this,
@@ -115,12 +119,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startLocationService() {
-        val serviceIntent = Intent(this, LocationService::class.java)
+    private fun startLocationService(context: Context, deviceId: String) {
+        val serviceIntent = Intent(this, LocationService::class.java).apply {
+            putExtra("EXTRA_DEVICE_ID", deviceId)
+            putExtra("EXTRA_FROM_BOOT", false)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
+            context.startForegroundService(serviceIntent)
         } else {
-            startService(serviceIntent)
+            context.startService(serviceIntent)
         }
     }
 }
@@ -363,10 +370,6 @@ fun MainScreen(
         }
     }
 
-    var isDeviceValid by remember { mutableStateOf(false) }
-    var validationMessage by remember { mutableStateOf("") }
-
-
     var isServiceRunning by remember {
         mutableStateOf(isLocationServiceRunning(context))
     }
@@ -530,8 +533,9 @@ fun MainScreen(
                     }
                     Badge(
                         containerColor = if (isServiceRunning) Color.Green else colorRojo,
-                        modifier = Modifier.size(10.dp)
-                    )
+                    ){
+                        Text(if(isServiceRunning) "ON" else "OFF")
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = colorAzulOscuro,
@@ -553,7 +557,7 @@ fun MainScreen(
                     locationsSent = locationsSent,
                     apiStatus = apiStatus,
                     lastLocation = lastLocation,
-                    validationMessage = validationMessage,
+                    validationMessage = validationState.second,
                     deviceId = deviceId,
                     isStartButtonEnabled = isStartButtonEnabled,
                     onStartStopClick = {
@@ -585,7 +589,7 @@ fun MainScreen(
                             isStartButtonEnabled = false
                             prefs.edit().putString("device_id", deviceId).apply()
                             prefs.edit().putBoolean("service_should_run", true).apply()
-                            startLocationService(context)
+                            startLocationService(context, deviceId)
                             isServiceRunning = true
                             Toast.makeText(context, "Monitoreo iniciado", Toast.LENGTH_SHORT).show()
                             scope.launch {
@@ -738,8 +742,11 @@ fun isBatteryOptimizationDisabled(context: Context): Boolean {
     return true
 }
 
-fun startLocationService(context: Context) {
-    val serviceIntent = Intent(context, LocationService::class.java)
+fun startLocationService(context: Context, deviceId: String) {
+    val serviceIntent = Intent(context, LocationService::class.java).apply {
+        putExtra("EXTRA_DEVICE_ID", deviceId)
+        putExtra("EXTRA_FROM_BOOT", false)
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         context.startForegroundService(serviceIntent)
     } else {

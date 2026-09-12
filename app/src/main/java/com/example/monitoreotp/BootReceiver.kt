@@ -7,13 +7,18 @@ import android.os.Build
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-            val deviceId = prefs.getString("device_id", "")
-            val shouldRun = prefs.getBoolean("service_should_run", false)
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == "android.intent.action.QUICKBOOT_POWERON") {
 
-            if (shouldRun && !deviceId.isNullOrEmpty() && deviceId.length == 15) {
-                val serviceIntent = Intent(context, LocationService::class.java)
+            val prefs = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            val shouldRun = prefs.getBoolean("service_should_run", false)
+            val deviceId = prefs.getString("device_id", "") ?: ""
+
+            if (shouldRun && deviceId.length == 15 && deviceId.matches(Regex("^\\d{15}$"))) {
+                val serviceIntent = Intent(context, LocationService::class.java).apply {
+                    putExtra("EXTRA_DEVICE_ID", deviceId)
+                    putExtra("EXTRA_FROM_BOOT", true)
+                }
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     context.startForegroundService(serviceIntent)
                 } else {
