@@ -590,6 +590,7 @@ fun MainScreen(
                             prefs.edit().putString("device_id", deviceId).apply()
                             prefs.edit().putBoolean("service_should_run", true).apply()
                             startLocationService(context, deviceId)
+                            MonitoreoTPApplication.scheduleBootJob(context)
                             isServiceRunning = true
                             Toast.makeText(context, "Monitoreo iniciado", Toast.LENGTH_SHORT).show()
                             scope.launch {
@@ -644,6 +645,7 @@ fun MainScreen(
                     onClick = {
                         if (stopCodeInput == stopCodeRequired) {
                             stopLocationService(context)
+                            MonitoreoTPApplication.cancelBootJob(context)
                             prefs.edit().putBoolean("service_should_run", false).apply()
                             isServiceRunning = false
                             showStopDialog = false
